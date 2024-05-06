@@ -1,0 +1,176 @@
+---
+title: "prediction"
+author: "Jiayi Zhang"
+date: "2024-04-27"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+library(sf)
+library(terra)
+library(raster)
+library(dplyr)
+library(ggplot2)
+library(stats)
+library(exactextractr)
+library(grDevices)
+library(spdep)
+library(spgwr)
+library(sp)
+```
+
+```{r}
+boundary <- vect("US_State_Boundaries.shp")
+gravity <- rast("GravityUS_part.tif")
+radiation <- rast("Solar_RadiationUS.tif")
+mete <- read.csv("Meteorite_Landings_20240414.csv")
+mete[is.na(mete)] <- 0  
+
+crs_boundary <- crs(boundary)
+crs_gravity <- crs(gravity)
+if (crs_boundary != crs_gravity) {
+  gravity <- project(gravity, crs_boundary)
+}
+
+# First, create matrices from the rasters
+gravity_matrix <- matrix(raster::values(gravity), ncol = ncol(gravity), nrow = nrow(gravity))
+radiation_matrix <- matrix(raster::values(radiation), ncol = ncol(radiation), nrow = nrow(radiation))
+
+# Prepare a data frame for the coordinates from USMetLandings
+coordinates_df <- as.data.frame(st_coordinates(USMetLandings))
+
+# Get indices of the points in the raster for the unique locations
+indices_gravity <- cellFromXY(gravity, coordinates_df)
+indices_radiation <- cellFromXY(radiation, coordinates_df)
+
+# Extract values using the indices for the unique locations
+USMetLandings$gravity <- gravity_matrix[indices_gravity]
+USMetLandings$radiation <- radiation_matrix[indices_radiation]
+
+# Separate the GeoLocation into latitude and longitude if not already done
+USMetLandings <- USMetLandings %>%
+  mutate(reclat = st_coordinates(geometry)[, 2],  
+         reclong = st_coordinates(geometry)[, 1]) 
+
+# Normalize gravity and radiation
+USMetLandings$gravity_norm <- scale(USMetLandings$gravity)
+USMetLandings$radiation_norm <- scale(USMetLandings$radiation)
+
+class(USMetLandings)
+```
+
+```{r}
+# Create a data frame for the next 30 years
+future_years <- seq(max(USMetLandings$year) + 1, by = 1, length.out = 30)
+
+future_data <- expand.grid(
+  year = future_years,
+  gravity_norm = mean(USMetLandings$gravity_norm),
+  radiation_norm = mean(USMetLandings$radiation_norm)
+)
+
+future_data$reclat <- mean(coordinates_df$reclat)
+future_data$reclong <- mean(coordinates_df$reclong)
+
+```
+
+```{r}
+coordinates <- st_coordinates(USMetLandings)
+data <- as.data.frame(USMetLandings)
+
+data$geometry <- NULL
+
+USMetLandings_sp <- SpatialPointsDataFrame(coords = coordinates, data = data,
+                                           proj4string = CRS(st_crs(USMetLandings)$proj4string))
+
+# Fit the GWR model using occurrence (fall) as a binary outcome (1 for occurred, 0 for not)
+USMetLandings_sp$occurrence <- ifelse(USMetLandings_sp@data$mass_g > 0, 1, 0)
+
+# Select an appropriate bandwidth
+bw <- gwr.sel(occurrence ~ radiation_norm, data = USMetLandings_sp, adapt = TRUE)
+
+# Fit the GWR model
+gwr_model <- gwr(occurrence ~ radiation_norm, data = USMetLandings_sp, bandwidth = bw, hatmatrix = TRUE)
+
+```
+
+
+```{r}
+results <- as.data.frame(gwr_model$SDF)
+results[is.na(results)] <- 0 
+results
+```
+
+```{r}
+USMetLandings<- st_transform(USMetLandings, st_crs(boundary))
+USMetLandings$pred <- results$pred
+
+ggplot(data = USMetLandings) +
+  geom_sf(aes(color = pred), size = 2) + 
+  scale_color_viridis_c() + 
+  labs(title = "Predictions from GWR", color = "") +
+  theme_minimal()
+```
+
+```{r}
+USMetLandings_pred <- USMetLandings[order(USMetLandings$pred, decreasing = TRUE), ]
+USMetLandings_pred
+```
+
+```{r}
+#  'pred' equals 1
+USMetLandings_pred_1 <- USMetLandings_pred %>%
+  filter(pred == 1)
+USMetLandings_pred_1
+```
+
+
+```{r}
+library(leaflet)
+library(sf)
+
+# Plot using leaflet
+leaflet(USMetLandings) %>%
+  addProviderTiles("CartoDB.Positron", options = providerTileOptions(noWrap = TRUE)) %>%
+  addCircleMarkers(lng = ~st_coordinates(USMetLandings)[, 1], 
+                   lat = ~st_coordinates(USMetLandings)[, 2], 
+                   color = ~colorNumeric("viridis", USMetLandings$pred)(USMetLandings$pred),
+                   opacity = 1,
+                   fillOpacity = 1,
+                   radius = 2) %>%
+  addLegend("bottomright", pal = colorNumeric("viridis", USMetLandings$pred), 
+            values = ~pred, 
+            title = "Predicted Value", 
+            opacity = 1)
+```
+
+
+```{r}
+leaflet(USMetLandings_pred_1) %>% 
+  addProviderTiles("CartoDB.DarkMatter") %>%  
+  addCircleMarkers(
+    lng = ~reclong, 
+    lat = ~reclat,
+    radius = ~sqrt(mass_g) /4,  
+    color = ~factpal(fall),     
+    popup = ~paste("Mass(g):", mass_g, "<br>Year:", year, "<br>Class:", recclass)  
+  ) %>%
+  setView(lng = center_lon, lat = center_lat, zoom = 4)
+```
+
+
+```{r}
+USMetLandings_pred_1 %>% 
+  leaflet() %>% 
+  addProviderTiles("CartoDB.DarkMatter") %>% 
+  addMarkers(
+    lng = ~reclong, 
+    lat = ~reclat,
+    clusterOptions = markerClusterOptions()
+  ) %>%
+  setView(lng = center_lon, lat = center_lat, zoom = 4)
+```
+
