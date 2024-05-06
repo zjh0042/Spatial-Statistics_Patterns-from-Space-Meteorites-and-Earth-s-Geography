@@ -1,0 +1,353 @@
+---
+title: "Meteorite Landings"
+author: "Jiayi Zhang"
+date: "2024-05-05"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(leaflet)
+library(leaflet.extras)
+library(DT)
+library(terra)
+library(spatstat)
+library(spdep)  
+library(ncf)    
+library(sf)
+```
+
+```{r}
+mete <- read.csv("Meteorite_Landings_20240414.csv")
+```
+
+```{r}
+dim(mete)
+colnames(mete)
+```
+
+```{r}
+missing_values <- sapply(mete, function(x) sum(is.na(x)))
+print(missing_values)
+print(sapply(mete, class))
+```
+
+```{r}
+# Define fill colors for the plots
+fillColor <- "#76b7b2" 
+fillColor2 <- "#f28e2b"  
+
+# Top 20 Most Frequent Meteorite Classes
+MeteoritesCount <- mete %>%
+  group_by(recclass) %>%
+  summarise(Count = n()) %>%
+  arrange(desc(Count)) %>%
+  ungroup() %>%
+  mutate(recclass = reorder(recclass, Count)) %>%
+  head(20) 
+
+MeteoritesCount %>%
+  ggplot(aes(x = recclass, y = Count)) +
+  geom_bar(stat = 'identity', colour = "white", fill = fillColor) +
+  geom_text(aes(x = recclass, y = 1, label = paste0("(", Count, ")")),
+            hjust = 0, vjust = 0.5, size = 5, colour = 'black', fontface = 'bold') +
+  labs(x = 'Meteorite Class', 
+       y = 'Count', 
+       title = 'Top 20 Most Frequent Meteorite Classes') +
+  coord_flip() + 
+  theme_minimal() +
+  theme(
+    axis.title.x = element_text(size = 14, face = "bold"),
+    axis.title.y = element_text(size = 14, face = "bold"),
+    plot.title = element_text(hjust = 0.5)
+  )
+
+# Top 20 Meteorite Classes by Mean Mass
+MetHeavyMean <- mete %>%
+  mutate(mass = mass_g / 1e3) %>%
+  group_by(recclass) %>%
+  summarise(MassMean = mean(mass, na.rm = TRUE)) %>%
+  arrange(desc(MassMean)) %>%
+  ungroup() %>%
+  mutate(recclass = reorder(recclass, MassMean)) %>%
+  head(20) 
+
+MetHeavyMean %>%
+  ggplot(aes(x = recclass, y = MassMean)) +
+  geom_bar(stat = 'identity', colour = "white", fill = fillColor2) +
+  geom_text(aes(x = recclass, y = 1, label = paste0("(", round(MassMean, 2), ")")),
+            hjust = 0, vjust = 0.5, size = 5, colour = 'black', fontface = 'bold') +
+  labs(x = 'Meteorite Class', 
+       y = 'Mean Mass (kg)', 
+       title = 'Top 20 Meteorite Classes by Mean Mass') +
+  coord_flip() + 
+  theme_minimal() +
+  theme(
+    axis.title.x = element_text(size = 14, face = "bold"),
+    axis.title.y = element_text(size = 14, face = "bold"),
+    plot.title = element_text(hjust = 0.5)
+  )
+```
+
+```{r}
+# Define bounding box for US coordinates
+top <- 49.3457868
+left <- -124.7844079
+right <- -66.9513812
+bottom <- 24.7433195
+
+# Filter US Meteorite Landings based on latitude and longitude
+USMetLandings <- mete %>%
+  filter(reclat >= bottom, reclat <= top, reclong >= left, reclong <= right)
+
+# Center coordinates for the map
+center_lon <- median(USMetLandings$reclong, na.rm = TRUE)
+center_lat <- median(USMetLandings$reclat, na.rm = TRUE)
+
+# Map of US Meteorite Landings
+leaflet(USMetLandings) %>% 
+  addProviderTiles("OpenTopoMap") %>%
+  addCircles(lng = ~reclong, lat = ~reclat, color = "black") %>%
+  setView(lng = center_lon, lat = center_lat, zoom = 4)
+
+# Data table of US Meteorite Landings
+datatable(USMetLandings, style = "bootstrap", class = "table-condensed", options = list(dom = 'tp', scrollX = TRUE))
+
+# Distribution of US Meteorite Landings with Meteorite Mass
+factpal <- colorFactor(c("purple", "thistle3"), USMetLandings$fall)
+
+leaflet(USMetLandings) %>% 
+  addProviderTiles("CartoDB.Positron") %>%
+  addCircles(
+    lng = ~reclong, 
+    lat = ~reclat, 
+    radius = ~(mass_g / 1e3) * 10, 
+    color = ~factpal(fall)
+  ) %>%
+  setView(lng = center_lon, lat = center_lat, zoom = 4) %>%
+  addLegend("bottomright", pal = factpal, values = ~fall, title = "Meteorites Landings and Fall", opacity = 1)
+```
+
+```{r}
+# Load the viridis package for colorblind-friendly palettes
+library(viridis)
+
+# Create a heatmap of US Meteorite Landings
+USMetLandings %>% 
+  leaflet() %>% 
+  addProviderTiles("CartoDB.DarkMatter") %>% 
+  addHeatmap(
+    lng = ~reclong, 
+    lat = ~reclat, 
+    intensity = ~mass_g,
+    blur = 20, 
+    max = 0.03, 
+    radius = 15,
+    gradient = viridis(256, option = "D")
+  ) %>%
+  setView(lng = center_lon, lat = center_lat, zoom = 4)
+```
+
+```{r}
+# Arrange US Meteorite Landings by mass and write to CSV
+USMetLandings <- USMetLandings %>% arrange(desc(mass_g))
+write.csv(USMetLandings, "USMeteoriteLandings.csv", row.names = FALSE)
+#datatable(USMetLandings, style = "bootstrap", class = "table-condensed", options = list(dom = 'tp', scrollX = TRUE))
+```
+
+```{r}
+# Set a color for the bars
+fillColor2 <- "#f28e2b"  
+
+# Process data to get the top 20 years with the most landings
+MetLandings <- USMetLandings %>%
+  group_by(year) %>%
+  summarise(Count = n()) %>%
+  arrange(desc(Count)) %>%
+  ungroup() %>%
+  mutate(year = reorder(year, Count)) %>%
+  head(20)
+
+# Plot the data
+MetLandingsPlot <- MetLandings %>%
+  ggplot(aes(x = year, y = Count)) +
+  geom_bar(stat = 'identity', colour = "white", fill = fillColor2) +
+  geom_text(aes(x = year, y = 1, label = paste0("(", Count, ")")),
+            hjust = 0, vjust = 0.5, size = 4, colour = 'black', fontface = 'bold') +
+  labs(x = 'Year of Meteorite Landings', 
+       y = 'Count', 
+       title = 'Top 20 Years with Most Meteorite Landings in the United States') +
+  coord_flip() + 
+  theme_bw()
+
+# Display the plot
+print(MetLandingsPlot)
+```
+
+```{r}
+# Create interactive circle markers for meteorite landings
+leaflet(USMetLandings) %>% 
+  addProviderTiles("CartoDB.Positron") %>%  
+  addCircleMarkers(
+    lng = ~reclong, 
+    lat = ~reclat,
+    radius = ~sqrt(mass_g) / 50,  
+    color = ~factpal(fall),     
+    popup = ~paste("Mass(g):", mass_g, "<br>Year:", year, "<br>Class:", recclass)  
+  ) %>%
+  setView(lng = center_lon, lat = center_lat, zoom = 4)
+```
+
+```{r}
+# Filter data post-1970 and summarize by year
+USMetLandings %>%
+    filter(year >= 1970) %>%
+    group_by(year) %>%
+    summarise(Count = n()) %>%
+    arrange(year) %>%
+
+    ggplot(aes(x = year, y = Count)) +
+    geom_bar(stat = 'identity', colour = "white", fill = fillColor) +
+    
+    labs(x = 'Meteorite Year', 
+         y = 'Count', 
+         title = 'Meteorite Year and Count') +
+        theme_bw()
+```
+
+```{r}
+# Convert US Meteorite Landings data into a spatial point pattern object
+coordinates <- USMetLandings[, c("reclong", "reclat"), drop = FALSE]
+window <- owin(xrange = range(coordinates$reclong, na.rm = TRUE), yrange = range(coordinates$reclat, na.rm = TRUE))
+mete_ppp <- ppp(coordinates$reclong, coordinates$reclat, window = window)
+
+# Calculate the kernel density estimate and plot it
+intensity <- density(mete_ppp)
+topo_colors <- topo.colors(120)
+plot(intensity, main = "Intensity of Meteorite Landings", col = topo_colors)
+
+# Perform spatial randomness tests
+quadrat.test(mete_ppp, nx = 5, ny = 5) 
+
+# Calculate spatial functions
+G <- Gest(mete_ppp)
+F <- Fest(mete_ppp)
+K <- Kest(mete_ppp)
+L <- Lest(mete_ppp, correction = "Ripley")
+
+# Plot spatial functions
+par(mfrow = c(1, 1))
+plot(G, main = "G-function")
+plot(F, main = "F-function")
+plot(K, main = "Ripley's K-function", xlab = "d (m)", ylab = "K(d)")
+plot(L, main = "Ripley's L-function", xlab = "d (km)", ylab = expression(hat("L")))
+
+# Fit a Poisson point process model and summarize
+fit <- ppm(mete_ppp ~ 1) 
+summary(fit)
+
+# Calculate and compare observed and simulated average nearest neighbor distances
+observed_nn <- mean(nndist(mete_ppp, k = 3))
+n <- 99 
+simulated_ann <- replicate(n, mean(nndist(rpoispp(lambda = mean(intensity), win = window), k = 3)))
+
+# Visual comparison of observed and simulated ANN values
+plot(simulated_ann, main = "Simulated ANN Values", xlab = "Simulation", ylab = "Average Nearest Neighbor Distance", type = "o", col = "blue")
+abline(h = observed_nn, col = "red")
+hist(simulated_ann, main = "Histogram of Simulated ANN Values", xlab = "Average Nearest Neighbor Distance", breaks = 30)
+abline(v = observed_nn, col = "red")
+
+# Convert to an sf object for more sophisticated spatial operations
+USMetLandings_sf <- st_as_sf(USMetLandings, coords = c("reclong", "reclat"), crs = 4326)
+
+# Calculate the nearest neighbor weight matrix and correlogram analysis
+coord_mete <- st_coordinates(USMetLandings_sf)
+mete_nn1 <- knn2nb(knearneigh(coord_mete, k = 3))
+Wmete_nn1_rowstd <- nb2listw(mete_nn1, style = "W", zero.policy = TRUE)
+
+# Define distance threshold for correlogram
+increment_value <- 0.5
+
+# Correlogram analysis for various distance considerations
+meteCorrelogram <- correlog(x = coord_mete[,1], y = coord_mete[,2], z = USMetLandings$mass_g, resamp = 10, increment = increment_value, quiet = TRUE, na.rm = TRUE)
+plot(meteCorrelogram, ylim = c(-0.4, 0.2), xlab = "Distance (m)", ylab = "Moran's I")
+abline(h = 0, lty = "dashed", lwd = 3, col = "red")
+
+# Analysis considering circular distance
+distance_threshold <- 0.3
+mete_nn_circular <- dnearneigh(coord_mete, d1 = 0, d2 = distance_threshold)
+Wmete_nn_circular_rowstd <- nb2listw(mete_nn_circular, style = "W", zero.policy = TRUE)
+
+# Replot correlogram with circular distance considerations
+plot(meteCorrelogram, ylim = c(-0.4, 0.2), xlab = "Distance (m)", ylab = "Moran's I")
+abline(h = 0, lty = "dashed", lwd = 3, col = "red")
+```
+
+```{r}
+# Calculate the average observed nearest neighbor distance
+observed_nn <- mean(nndist(mete_ppp))
+observed_nn
+```
+
+```{r}
+# Calculate the mean and standard deviation of the simulated nearest neighbor distances
+sim_mean <- mean(simulated_ann)
+sim_sd <- sd(simulated_ann)
+z_score <- (observed_nn - sim_mean) / sim_sd
+p_value <- 2 * pnorm(-abs(z_score))
+
+z_score
+p_value
+
+```
+
+```{r}
+library(spatstat)
+library(grDevices)
+
+# Convert the US Meteorite Landings data frame to a point pattern object
+coordinates <- USMetLandings[, c("reclong", "reclat"), drop = FALSE]
+window <- owin(xrange = range(coordinates$reclong, na.rm = TRUE), yrange = range(coordinates$reclat, na.rm = TRUE))
+mete_ppp <- ppp(coordinates$reclong, coordinates$reclat, window = window)
+
+# Calculate kernel density with specified smoothing
+intensity <- density(mete_ppp, sigma = 3, adjust = 1)
+
+# Define a function to plot high-density areas
+plot_high_density <- function(intensity, threshold, color_palette, pch_symbol, file_name) {
+  # Determine high-density threshold
+  high_density_threshold <- max(intensity$v) * threshold
+
+  # Mask non-high-density areas
+  intensity_masked <- intensity
+  intensity_masked$v[intensity$v < high_density_threshold] <- NA
+
+  # Open PNG device
+  png(filename = file_name, width = 12, height = 8, units = "in", res = 1000)
+
+  # Plot the high-density areas
+  plot(intensity_masked, main = paste("High-Density Areas (Threshold:", threshold * 100, "%)"), col = color_palette)
+  plot(mete_ppp, add = TRUE, pch = pch_symbol, cex = 0.2)
+
+  # Create a data frame and remove duplicate rows based on grid cell centers
+  intensity_df_high <- as.data.frame(intensity_masked, na.rm = TRUE)
+  unique_intensity_df_high <- intensity_df_high[!duplicated(intensity_df_high[c("x", "y")]), ]
+
+  # Add text labels for high-density values at unique locations
+  with(unique_intensity_df_high, text(x, y, labels = round(value, 2), cex = 0.2))
+
+  # Close the graphics device
+  dev.off()
+}
+
+# Execute function for different thresholds
+plot_high_density(intensity, 0.7, topo.colors(120), 20, "High_Density_Areas_70.png")
+plot_high_density(intensity, 0.5, topo.colors(125), 25, "High_Density_Areas_50.png")
+```
+
