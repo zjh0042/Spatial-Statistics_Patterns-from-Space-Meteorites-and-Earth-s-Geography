@@ -1,0 +1,336 @@
+---
+title: "Gravity"
+author: "Jiayi Zhang"
+date: "2024-04-21"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(sf)
+library(raster)
+library(dplyr)
+library(ggplot2)
+library(stats)
+library(exactextractr)
+library(grDevices)
+library(spdep)
+library(spgwr)
+```
+
+```{r}
+# Load spatial and CSV data
+boundary <- vect("US_State_Boundaries.shp")
+gravity <- rast("GravityUS_part.tif")
+radiation <- rast("Solar_RadiationUS.tif")
+mete <- read.csv("Meteorite_Landings_20240414.csv")
+mete[is.na(mete)] <- 0  
+```
+
+```{r}
+# Check and align CRS (Coordinate Reference System)
+crs_boundary <- crs(boundary)
+crs_gravity <- crs(gravity)
+if (crs_boundary != crs_gravity) {
+  gravity <- project(gravity, crs_boundary)
+}
+
+# Filter and transform meteorite landing data to match the boundary CRS
+USMetLandings <- mete %>%
+  filter(reclat >= 24.7433195, reclat <= 49.3457868,
+         reclong >= -124.7844079, reclong <= -66.9513812) %>%
+  st_as_sf(coords = c("reclong", "reclat"), crs = 4326) %>%
+  st_transform(crs = crs_boundary)
+```
+
+
+```{r}
+# Generate color palette and plot gravity and radiation maps
+sunset_colors <- hcl.colors(500, "berlin")
+plot(gravity, main = "Gravity Map with Meteorite Landings", col = sunset_colors, alpha = 0.5)
+plot(st_geometry(USMetLandings), add = TRUE, col = 'black', pch = 1, cex = 0.3)
+legend("topright", inset = c(-0.1, 1), legend = c("Meteorite Landings"), col = "black", pch = 1, cex = 0.8, bty = "n")
+plot(radiation, main = "Radiation Map with Meteorite Landings", col = sunset_colors, alpha = 0.5)
+plot(st_geometry(USMetLandings), add = TRUE, col = 'black', pch = 1, cex = 0.3)
+```
+
+
+```{r}
+#print(st_geometry_type(USMetLandings))
+USMetLandings
+```
+
+**Prepare the data for the model***
+
+```{r}
+# First, create matrices from the rasters
+gravity_matrix <- matrix(raster::values(gravity), ncol = ncol(gravity), nrow = nrow(gravity))
+radiation_matrix <- matrix(raster::values(radiation), ncol = ncol(radiation), nrow = nrow(radiation))
+
+# Prepare a data frame for the coordinates from USMetLandings
+coordinates_df <- as.data.frame(st_coordinates(USMetLandings))
+
+# Get indices of the points in the raster for the unique locations
+indices_gravity <- cellFromXY(gravity, coordinates_df)
+indices_radiation <- cellFromXY(radiation, coordinates_df)
+
+# Extract values using the indices for the unique locations
+USMetLandings$gravity <- gravity_matrix[indices_gravity]
+USMetLandings$radiation <- radiation_matrix[indices_radiation]
+
+# Separate the GeoLocation into latitude and longitude if not already done
+USMetLandings <- USMetLandings %>%
+  mutate(reclat = st_coordinates(geometry)[, 2],  
+         reclong = st_coordinates(geometry)[, 1]) 
+
+# Normalize gravity and radiation
+USMetLandings$gravity_norm <- scale(USMetLandings$gravity)
+USMetLandings$radiation_norm <- scale(USMetLandings$radiation)
+
+# Aggregate by reclat and reclong to count occurrences
+USMetLandings_count <- USMetLandings %>%
+  group_by(reclat, reclong) %>%
+  summarise(count = n(), 
+            gravity_norm = mean(gravity_norm),  
+            radiation_norm = mean(radiation_norm), .groups = 'drop')
+
+```
+
+```{r}
+USMetLandings_count
+```
+
+
+```{r}
+library(leaflet)
+
+leaflet(USMetLandings_count) %>%
+  addTiles() %>%  
+  addCircles(
+    lng = ~reclong,   
+    lat = ~reclat,   
+    weight = 1,
+    radius = ~abs(gravity_norm) * 100,  
+    color = ~ifelse(gravity_norm > 0, "blue", "red"), 
+    fillColor = ~ifelse(gravity_norm > 0, "blue", "red"),
+    fillOpacity = 1,
+    opacity = 2,
+    popup = ~paste("Gravity Norm:", gravity_norm)  
+  ) %>%
+  addLegend(
+    position = "bottomright",
+    colors = c("blue", "red"),
+    labels = c("High Gravity", "Low Gravity"),
+    opacity = 1.0,
+    title = "Gravity Levels"
+  )
+
+```
+
+
+***Linear Regression***
+
+```{r}
+# Fit the linear model using the normalized values and aggregated count
+model <- lm(count ~ gravity_norm + radiation_norm, data = USMetLandings_count)
+summary(model)
+
+# Prepare data by calculating log-transformed count
+USMetLandings_count$log_count <- log(USMetLandings_count$count + 1)
+
+# Scatter plot for gravity normalized values vs log-transformed count with regression line
+ggplot(USMetLandings_count, aes(x = gravity_norm, y = log_count)) +
+  geom_point() +
+  geom_smooth(method = "lm", color = "blue") +
+  labs(x = "Normalized Gravity", y = "Log of Count of Meteorite Landings + 1",
+       title = "Log-Transformed Regression of Meteorite Landings on Normalized Gravity") +
+  theme_minimal()
+
+# Scatter plot for radiation normalized values vs log-transformed count with regression line
+ggplot(USMetLandings_count, aes(x = radiation_norm, y = log_count)) +
+  geom_point() +
+  geom_smooth(method = "lm", color = "red") +
+  labs(x = "Normalized Radiation", y = "Log of Count of Meteorite Landings + 1",
+       title = "Log-Transformed Regression of Meteorite Landings on Normalized Radiation") +
+  theme_minimal()
+
+# Fit the linear model using the log-transformed count and generate diagnostic plots
+log_model <- lm(log_count ~ gravity_norm + radiation_norm, data = USMetLandings_count)
+par(mfrow = c(1, 1))  
+plot(log_model)
+```
+
+```{r}
+# Read and transform boundary data
+boundary <- st_read("US_State_Boundaries.shp")
+USMetLandings_count <- st_as_sf(USMetLandings_count, coords = c("reclong", "reclat"), crs = 4326)
+USMetLandings_count <- st_transform(USMetLandings_count, st_crs(boundary))
+
+# Calculate and bind residuals from the model
+resids <- residuals(log_model)
+USMetLandings_count$resids <- resids
+
+# Perform a spatial join and calculate mean residuals by boundary
+agg_resids <- st_join(boundary, USMetLandings_count, join = st_nearest_feature)
+boundary_resids <- agg_resids %>%
+  group_by(FID) %>%
+  summarise(mean_resid = mean(resids, na.rm = TRUE), .groups = 'drop')
+
+# Visualize mean residuals by boundary
+ggplot(data = boundary_resids) +
+  geom_sf(aes(fill = mean_resid)) +
+  labs(title = "Mean Residuals by Boundary", fill = "Mean Residual") +
+  theme_minimal()
+
+```
+
+```{r}
+# Weights for Moran's I analysis
+map.resids <- as(USMetLandings_count, "Spatial")
+knn_weights <- knn2nb(knearneigh(coordinates(map.resids), k = 4))
+listw <- nb2listw(knn_weights, style = "W")
+
+# Calculate and print global Moran's I for the residuals
+moran <- moran.test(map.resids$resids, listw)
+print(moran)
+
+# Calculate and join local Moran's I values to the spatial polygons
+local_moran <- localmoran(map.resids$resids, listw)
+USMetLandings_count$localI <- local_moran[,5]
+boundary_localI <- st_join(boundary, USMetLandings_count, join = st_nearest_feature)
+
+# Visualize the Local Moran's I on the map
+ggplot(data = boundary_localI) +
+  geom_sf(aes(fill = localI)) +
+  labs(title = "Local Moran's I by Boundary", fill = "Local Moran's I") +
+  theme_minimal()
+```
+
+***GWR***
+
+```{r}
+# Calculate the optimal bandwidth for the Geographically Weighted Regression (GWR)
+GWRbandwidth <- gwr.sel(count ~ gravity_norm + radiation_norm, 
+                        data = USMetLandings_count, 
+                        coords = cbind(USMetLandings_count$reclong, USMetLandings_count$reclat),
+                        adapt = T)
+# Fit the GWR model using the previously calculated bandwidth
+gwr.model <- gwr(count ~ gravity_norm + radiation_norm,
+                 data = USMetLandings_count,
+                 coords = cbind(USMetLandings_count$reclong, USMetLandings_count$reclat),
+                 adapt = GWRbandwidth,
+                 hatmatrix = TRUE,
+                 se.fit = TRUE)
+# Display the GWR model results
+print(gwr.model)
+# Convert GWR model results into a data frame and display the names of the columns
+results <- as.data.frame(gwr.model$SDF)
+```
+
+```{r}
+results 
+```
+
+
+***Visualization of Local R^2 Values***
+
+```{r}
+USMetLandings_count <- st_transform(USMetLandings_count, st_crs(boundary))
+USMetLandings_count$localR2 <- results$localR2
+
+ggplot(data = USMetLandings_count) +
+  geom_sf(aes(color = localR2), size = 2) + 
+  scale_color_viridis_c() + 
+  labs(title = "Local R-squared Values from GWR", color = "Local R²") +
+  theme_minimal()
+```
+
+```{r}
+library(ggplot2)
+library(viridis)
+
+ggplot(data = USMetLandings_count) +
+  geom_sf(aes(color = localR2), size = 3) + 
+  scale_color_viridis_c() + 
+  labs(title = "Local R-squared Values from GWR", color = "Local R²") +
+  theme(
+    plot.background = element_rect(fill = "black"),
+    panel.background = element_rect(fill = "black"),
+    legend.background = element_rect(fill = "black"),
+    legend.key = element_rect(fill = "black"),
+    legend.title = element_text(color = "white"),
+    legend.text = element_text(color = "white"),
+    plot.title = element_text(color = "white"),
+    axis.title = element_text(color = "white"),
+    axis.text = element_text(color = "white"),
+    panel.grid.major = element_line(color = "gray60"),
+    panel.grid.minor = element_line(color = "gray40")
+  )
+
+```
+
+
+```{r}
+# Perform a spatial join using st_join, attaching the nearest boundary polygon data to each point
+agg_localR2 <- st_join(boundary, USMetLandings_count, join = st_nearest_feature)
+
+# Aggregate the local R-squared values by boundary polygon
+boundary_localR2 <- agg_localR2 %>%
+  group_by(FID) %>%
+  summarise(mean_localR2 = mean(localR2, na.rm = TRUE), .groups = 'drop')
+
+# Plot aggregated Local R-squared values
+ggplot(data = boundary_localR2) +
+  geom_sf(aes(fill = mean_localR2)) +
+  labs(title = "Mean Local R-squared by Boundary", fill = "Mean Local R²") +
+  theme_minimal()
+```
+
+
+```{r}
+# Make sure CRS matches between USMetLandings_count and boundary
+USMetLandings_count <- st_transform(USMetLandings_count, st_crs(boundary))
+
+# Convert to Spatial for spdep compatibility if needed
+map.localR2 <- as(USMetLandings_count, "Spatial")
+
+# Create a spatial weights matrix using k-nearest neighbors
+knn_weights <- knn2nb(knearneigh(coordinates(map.localR2), k = 4))
+listw <- nb2listw(knn_weights, style = "W")
+
+# Compute Local Moran's I for local R^2 values
+local_moran_localR2 <- localmoran(USMetLandings_count$localR2, listw)
+
+# Add Local Moran's I statistics and p-values back to USMetLandings_count
+USMetLandings_count$localI <- local_moran_localR2[,1]  
+USMetLandings_count$p.value <- local_moran_localR2[,4]  
+
+# Perform a spatial join using st_join, attaching the nearest boundary polygon data to each point
+agg_localI <- st_join(boundary, USMetLandings_count, join = st_nearest_feature)
+
+# Aggregate the Local Moran's I values by boundary polygon if necessary
+boundary_localI <- agg_localI %>%
+  group_by(FID) %>%
+  summarise(mean_localI = mean(localI, na.rm = TRUE),
+            significant = sum(p.value < 0.05, na.rm = TRUE),  # Count significant localI
+            .groups = 'drop')
+
+# Filling the polygons based on mean Local Moran's I
+ggplot(data = boundary_localI) +
+  geom_sf(aes(fill = mean_localI)) +
+  labs(title = "Local Moran's I for Local R² by Boundary", fill = "Local Moran's I") +
+  theme_minimal()
+```
+
+
+```{r}
+ggplot(data = boundary_localI) +
+  geom_sf(aes(fill = mean_localI)) +
+  scale_fill_viridis_c() +  # Use the "plasma" color scale
+  labs(title = "Local Moran's I for Local R² by Boundary", fill = "Local Moran's I") +
+  theme_minimal()
+
+```
+
